@@ -1,0 +1,5 @@
+# ags extension
+comment = 'Advanced Generalized Search access method - GiST-based advanced index'
+default_version = '1.0'
+module_pathname = '$libdir/ags'
+relocatable = true
