@@ -115,6 +115,15 @@ gistRedoPageUpdateRecord(XLogReaderState *record)
 
 		page = (Page) BufferGetPage(buffer);
 
+		if (xldata->skipoffnum != InvalidOffsetNumber)
+		{
+			IndexTuple skiptuple = (IndexTuple) PageGetItem(page, PageGetItemId(page, xldata->skipoffnum));
+			int newskipgroupsize = GistTupleGetSkipCount(skiptuple) + xldata->ntoinsert - xldata->ntodelete;
+
+			Assert(GistTupleIsSkip(skiptuple));
+			GistTupleSetSkipCount(skiptuple, newskipgroupsize);
+		}
+
 		if (xldata->ntodelete == 1 && xldata->ntoinsert == 1)
 		{
 			/*
@@ -517,14 +526,17 @@ XLogRecPtr
 gistXLogUpdate(Buffer buffer,
 			   OffsetNumber *todelete, int ntodelete,
 			   IndexTuple *itup, int ituplen,
-			   Buffer leftchildbuf)
+			   Buffer leftchildbuf, OffsetNumber skipoffnum)
 {
 	gistxlogPageUpdate xlrec;
 	int			i;
 	XLogRecPtr	recptr;
 
+	char *start, *end;
+
 	xlrec.ntodelete = ntodelete;
 	xlrec.ntoinsert = ituplen;
+	xlrec.skipoffnum = skipoffnum;
 
 	XLogBeginInsert();
 	XLogRegisterData((char *) &xlrec, sizeof(gistxlogPageUpdate));
@@ -533,8 +545,26 @@ gistXLogUpdate(Buffer buffer,
 	XLogRegisterBufData(0, (char *) todelete, sizeof(OffsetNumber) * ntodelete);
 
 	/* new tuples */
-	for (i = 0; i < ituplen; i++)
-		XLogRegisterBufData(0, (char *) (itup[i]), IndexTupleSize(itup[i]));
+	if (ituplen > 0)
+	{
+		start = (char *) itup[0];
+		end = start + IndexTupleSize(itup[0]);
+		for (i = 1; i < ituplen; i++)
+		{
+			if (end == (char *) itup[i])
+			{
+				end += IndexTupleSize(itup[i]);
+				continue;
+			}
+			else
+			{
+				XLogRegisterBufData(0, start, end - start);
+				start = (char *) itup[i];
+				end = start + IndexTupleSize(itup[i]);
+			}
+		}
+		XLogRegisterBufData(0, start, end - start);
+	}
 
 	/*
 	 * Include a full page image of the child buf. (only necessary if a

@@ -34,8 +34,9 @@
 typedef struct gistxlogPageUpdate
 {
 	/* number of deleted offsets */
-	uint16		ntodelete;
-	uint16		ntoinsert;
+	uint16	 	 ntodelete;
+	uint16		 ntoinsert;
+	OffsetNumber skipoffnum;
 
 	/*
 	 * In payload of blk 0 : 1. todelete OffsetNumbers 2. tuples to insert

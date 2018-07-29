@@ -39,28 +39,28 @@ typedef struct
 
 static void setinternal(GistVacState *state, BlockNumber blkno)
 {
-	if (state->mapNumPages > blkno)
+	if (state->mapNumPages <= blkno)
 		return;
 	state->internalPagesMap[blkno / 8] |= 1 << (blkno % 8);
 }
 
 static void setempty(GistVacState *state, BlockNumber blkno)
 {
-	if (state->mapNumPages > blkno)
+	if (state->mapNumPages <= blkno)
 		return;
 	state->emptyLeafPagesMap[blkno / 8] |= 1 << (blkno % 8);
 }
 
 static bool isinternal(GistVacState *state, BlockNumber blkno)
 {
-	if (state->mapNumPages > blkno)
+	if (state->mapNumPages <= blkno)
 		return false;
 	return (state->internalPagesMap[blkno / 8] & 1 << (blkno % 8)) != 0;
 }
 
 static bool isemptyleaf(GistVacState *state, BlockNumber blkno)
 {
-	if (state->mapNumPages > blkno)
+	if (state->mapNumPages <= blkno)
 		return false;
 	return (state->internalPagesMap[blkno / 8] & 1 << (blkno % 8)) != 0;
 }
@@ -165,6 +165,7 @@ gistvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	vstate.callback_state = callback_state;
 	vstate.startNSN = startNSN;
 	vstate.totFreePages = 0;
+	vstate.mapNumPages = 0;
 
 	/*
 	 * Need lock unless it's local to this backend.
@@ -173,7 +174,7 @@ gistvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 
 	/*
 	 * FIXME: copied from btvacuumscan. Check that all this also holds for
-	 * GiST! 
+	 * GiST!
 	 * AB: Yes, gistNewBuffer() takes LockRelationForExtension()
 	 *
 	 * The outer loop iterates over all index pages, in
@@ -281,7 +282,6 @@ gistvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			if (PageIsNew(page) || GistPageIsDeleted(page))
 			{
 				UnlockReleaseBuffer(buffer);
-				/* TODO: Should not we record free page here? */
 				continue;
 			}
 
@@ -321,6 +321,7 @@ gistvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 
 			if (ntodelete)
 			{
+				TransactionId txid;
 				/* Prepare possibly onurdered offsets */
 				qsort(todelete, ntodelete, sizeof(OffsetNumber), compare_offsetnumber);
 
@@ -330,7 +331,7 @@ gistvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 				 * ReadNewTransactionId() to instead of GetCurrentTransactionId
 				 * since we are in a VACUUM.
 				 */
-				TransactionId txid = ReadNewTransactionId();
+				txid = ReadNewTransactionId();
 
 				START_CRIT_SECTION();
 
@@ -472,7 +473,7 @@ restart:
 
 				recptr = gistXLogUpdate(buffer,
 										todelete, ntodelete,
-										NULL, 0, InvalidBuffer);
+										NULL, 0, InvalidBuffer, InvalidOffsetNumber);
 				PageSetLSN(page, recptr);
 			}
 			else

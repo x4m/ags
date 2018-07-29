@@ -55,7 +55,7 @@ gistfillbuffer(Page page, IndexTuple *itup, int len, OffsetNumber off)
  * Check space for itup vector on page
  */
 bool
-gistnospace(Page page, IndexTuple *itvec, int len, OffsetNumber todelete, Size freespace)
+gistnospace(Page page, IndexTuple *itvec, int len, OffsetNumber todelete, Size freespace, int ndeltup)
 {
 	unsigned int size = freespace,
 				deleted = 0;
@@ -64,11 +64,14 @@ gistnospace(Page page, IndexTuple *itvec, int len, OffsetNumber todelete, Size f
 	for (i = 0; i < len; i++)
 		size += IndexTupleSize(itvec[i]) + sizeof(ItemIdData);
 
-	if (todelete != InvalidOffsetNumber)
+	if (OffsetNumberIsValid(todelete))
 	{
-		IndexTuple	itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, todelete));
+		for (i = 0; i < ndeltup; i++)
+		{
+			IndexTuple	itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, todelete + i));
 
-		deleted = IndexTupleSize(itup) + sizeof(ItemIdData);
+			deleted = IndexTupleSize(itup) + sizeof(ItemIdData);
+		}
 	}
 
 	return (PageGetFreeSpace(page) + deleted < size);
@@ -107,15 +110,68 @@ gistextractpage(Page page, int *len /* out */ )
 }
 
 /*
+ * Read range into itup vector
+ */
+IndexTuple *
+gistextractrange(Page page, OffsetNumber start, int len)
+{
+	OffsetNumber i,
+				maxoff;
+	IndexTuple *itvec,
+			   *itvecnext;
+
+	maxoff = PageGetMaxOffsetNumber(page);
+	Assert(maxoff >= start + len - 1);
+
+	/* caller will use this x2 allocation */
+	itvecnext = itvec = palloc(sizeof(IndexTuple) * len * 2);
+
+	for (i = start; i < start + len; i = OffsetNumberNext(i))
+	{
+		IndexTuple tup = (IndexTuple) PageGetItem(page, PageGetItemId(page, i));
+		Assert(!GistTupleIsSkip(tup));
+		*itvecnext = tup;
+		itvecnext++;
+	}
+
+	return itvec;
+}
+
+/*
  * join two vectors into one
  */
 IndexTuple *
-gistjoinvector(IndexTuple *itvec, int *len, IndexTuple *additvec, int addlen)
+gistjoinvector(IndexTuple *itvec, int *len, IndexTuple *additvec, int addlen, OffsetNumber oldoffnum)
 {
+	if (!OffsetNumberIsValid(oldoffnum))
+		oldoffnum = *len;
+	else
+		oldoffnum -= FirstOffsetNumber;
 	itvec = (IndexTuple *) repalloc((void *) itvec, sizeof(IndexTuple) * ((*len) + addlen));
-	memmove(&itvec[*len], additvec, sizeof(IndexTuple) * addlen);
+	if (oldoffnum < *len)
+		memmove(&itvec[oldoffnum + addlen], &itvec[oldoffnum], sizeof(IndexTuple) * (*len - oldoffnum));
+	memmove(&itvec[oldoffnum], additvec, sizeof(IndexTuple) * addlen);
 	*len += addlen;
 	return itvec;
+}
+
+/*
+ * join two vectors into one
+ */
+void
+gistfiltervector(IndexTuple *itvec, int *len)
+{
+	int i;
+	int newlen = 0;
+	int oldlen = *len;
+
+	for (i = 0; i < oldlen; i++)
+	{
+		if (GistTupleIsSkip(itvec[i]))
+			continue;
+		itvec[newlen++] = itvec[i];
+	}
+	*len = newlen;
 }
 
 /*
@@ -160,7 +216,7 @@ gistMakeUnionItVec(GISTSTATE *giststate, IndexTuple *itvec, int len,
 
 	evec = (GistEntryVector *) palloc((len + 2) * sizeof(GISTENTRY) + GEVHDRSZ);
 
-	for (i = 0; i < giststate->tupdesc->natts; i++)
+	for (i = 0; i < giststate->truncTupdesc->natts; i++)
 	{
 		int			j;
 
@@ -221,7 +277,7 @@ gistunion(Relation r, IndexTuple *itvec, int len, GISTSTATE *giststate)
 
 	gistMakeUnionItVec(giststate, itvec, len, attr, isnull);
 
-	return gistFormTuple(giststate, r, attr, isnull, false);
+	return gistFormTuple(giststate, r, attr, isnull, false, true);
 }
 
 /*
@@ -296,7 +352,7 @@ gistDeCompressAtt(GISTSTATE *giststate, Relation r, IndexTuple tuple, Page p,
 {
 	int			i;
 
-	for (i = 0; i < r->rd_att->natts; i++)
+	for (i = 0; i < IndexRelationGetNumberOfKeyAttributes(r); i++)
 	{
 		Datum		datum;
 
@@ -329,7 +385,7 @@ gistgetadjusted(Relation r, IndexTuple oldtup, IndexTuple addtup, GISTSTATE *gis
 	gistDeCompressAtt(giststate, r, addtup, NULL,
 					  (OffsetNumber) 0, addentries, addisnull);
 
-	for (i = 0; i < r->rd_att->natts; i++)
+	for (i = 0; i < IndexRelationGetNumberOfKeyAttributes(r); i++)
 	{
 		gistMakeUnionKey(giststate, i,
 						 oldentries + i, oldisnull[i],
@@ -355,8 +411,13 @@ gistgetadjusted(Relation r, IndexTuple oldtup, IndexTuple addtup, GISTSTATE *gis
 	if (neednew)
 	{
 		/* need to update key */
-		newtup = gistFormTuple(giststate, r, attr, isnull, false);
+		newtup = gistFormTuple(giststate, r, attr, isnull, false, true);
 		newtup->t_tid = oldtup->t_tid;
+		if (GistTupleIsSkip(oldtup))
+		{
+			GistTupleMakeSkip(newtup);
+			GistTupleSetSkipCount(newtup, GistTupleGetSkipCount(oldtup));
+		}
 	}
 
 	return newtup;
@@ -370,10 +431,11 @@ gistgetadjusted(Relation r, IndexTuple oldtup, IndexTuple addtup, GISTSTATE *gis
  */
 OffsetNumber
 gistchoose(Relation r, Page p, IndexTuple it,	/* it has compressed entry */
-		   GISTSTATE *giststate)
+		   GISTSTATE *giststate, OffsetNumber *skipoffnum)
 {
 	OffsetNumber result;
 	OffsetNumber maxoff;
+	OffsetNumber prevskip = InvalidOffsetNumber;
 	OffsetNumber i;
 	float		best_penalty[INDEX_MAX_KEYS];
 	GISTENTRY	entry,
@@ -439,98 +501,121 @@ gistchoose(Relation r, Page p, IndexTuple it,	/* it has compressed entry */
 		bool		zero_penalty;
 		int			j;
 
-		zero_penalty = true;
-
-		/* Loop over index attributes. */
-		for (j = 0; j < r->rd_att->natts; j++)
+		if (GistTupleIsSkip(itup))
 		{
 			Datum		datum;
 			float		usize;
 			bool		IsNull;
 
-			/* Compute penalty for this column. */
-			datum = index_getattr(itup, j + 1, giststate->tupdesc, &IsNull);
-			gistdentryinit(giststate, j, &entry, datum, r, p, i,
-						   false, IsNull);
-			usize = gistpenalty(giststate, j, &entry, IsNull,
-								&identry[j], isnull[j]);
-			if (usize > 0)
-				zero_penalty = false;
+			prevskip = i;
 
-			if (best_penalty[j] < 0 || usize < best_penalty[j])
+			datum = index_getattr(itup, 1, giststate->tupdesc, &IsNull);
+			gistdentryinit(giststate, 0, &entry, datum, r, p, i,
+							false, IsNull);
+			usize = gistpenalty(giststate, 0, &entry, IsNull,
+									&identry[0], isnull[0]);
+			if (usize > best_penalty[0] && best_penalty[0] != -1)
 			{
-				/*
-				 * New best penalty for column.  Tentatively select this tuple
-				 * as the target, and record the best penalty.  Then reset the
-				 * next column's penalty to "unknown" (and indirectly, the
-				 * same for all the ones to its right).  This will force us to
-				 * adopt this tuple's penalty values as the best for all the
-				 * remaining columns during subsequent loop iterations.
-				 */
-				result = i;
-				best_penalty[j] = usize;
-
-				if (j < r->rd_att->natts - 1)
-					best_penalty[j + 1] = -1;
-
-				/* we have new best, so reset keep-it decision */
-				keep_current_best = -1;
-			}
-			else if (best_penalty[j] == usize)
-			{
-				/*
-				 * The current tuple is exactly as good for this column as the
-				 * best tuple seen so far.  The next iteration of this loop
-				 * will compare the next column.
-				 */
-			}
-			else
-			{
-				/*
-				 * The current tuple is worse for this column than the best
-				 * tuple seen so far.  Skip the remaining columns and move on
-				 * to the next tuple, if any.
-				 */
-				zero_penalty = false;	/* so outer loop won't exit */
-				break;
+				i += GistTupleGetSkipCount(itup);
 			}
 		}
-
-		/*
-		 * If we looped past the last column, and did not update "result",
-		 * then this tuple is exactly as good as the prior best tuple.
-		 */
-		if (j == r->rd_att->natts && result != i)
+		else
 		{
-			if (keep_current_best == -1)
-			{
-				/* we didn't make the random choice yet for this old best */
-				keep_current_best = (random() <= (MAX_RANDOM_VALUE / 2)) ? 1 : 0;
-			}
-			if (keep_current_best == 0)
-			{
-				/* we choose to use the new tuple */
-				result = i;
-				/* choose again if there are even more exactly-as-good ones */
-				keep_current_best = -1;
-			}
-		}
+			zero_penalty = true;
 
-		/*
-		 * If we find a tuple with zero penalty for all columns, and we've
-		 * decided we don't want to search for another tuple with equal
-		 * penalty, there's no need to examine remaining tuples; just break
-		 * out of the loop and return it.
-		 */
-		if (zero_penalty)
-		{
-			if (keep_current_best == -1)
+			/* Loop over index attributes. */
+			for (j = 0; j < IndexRelationGetNumberOfKeyAttributes(r); j++)
 			{
-				/* we didn't make the random choice yet for this old best */
-				keep_current_best = (random() <= (MAX_RANDOM_VALUE / 2)) ? 1 : 0;
+				Datum		datum;
+				float		usize;
+				bool		IsNull;
+
+				/* Compute penalty for this column. */
+				datum = index_getattr(itup, j + 1, giststate->tupdesc, &IsNull);
+				gistdentryinit(giststate, j, &entry, datum, r, p, i,
+							false, IsNull);
+				usize = gistpenalty(giststate, j, &entry, IsNull,
+									&identry[j], isnull[j]);
+				if (usize > 0)
+					zero_penalty = false;
+
+				if (best_penalty[j] < 0 || usize < best_penalty[j])
+				{
+					/*
+					* New best penalty for column.  Tentatively select this tuple
+					* as the target, and record the best penalty.  Then reset the
+					* next column's penalty to "unknown" (and indirectly, the
+					* same for all the ones to its right).  This will force us to
+					* adopt this tuple's penalty values as the best for all the
+					* remaining columns during subsequent loop iterations.
+					*/
+					result = i;
+					*skipoffnum = prevskip;
+					best_penalty[j] = usize;
+
+					if (j < IndexRelationGetNumberOfKeyAttributes(r) - 1)
+						best_penalty[j + 1] = -1;
+
+					/* we have new best, so reset keep-it decision */
+					keep_current_best = -1;
+				}
+				else if (best_penalty[j] == usize)
+				{
+					/*
+					* The current tuple is exactly as good for this column as the
+					* best tuple seen so far.  The next iteration of this loop
+					* will compare the next column.
+					*/
+				}
+				else
+				{
+					/*
+					* The current tuple is worse for this column than the best
+					* tuple seen so far.  Skip the remaining columns and move on
+					* to the next tuple, if any.
+					*/
+					zero_penalty = false;	/* so outer loop won't exit */
+					break;
+				}
 			}
-			if (keep_current_best == 1)
-				break;
+
+			/*
+			* If we looped past the last column, and did not update "result",
+			* then this tuple is exactly as good as the prior best tuple.
+			*/
+			if (j == IndexRelationGetNumberOfKeyAttributes(r) && result != i)
+			{
+				if (keep_current_best == -1)
+				{
+					/* we didn't make the random choice yet for this old best */
+					keep_current_best = (random() <= (MAX_RANDOM_VALUE / 2)) ? 1 : 0;
+				}
+				if (keep_current_best == 0)
+				{
+					/* we choose to use the new tuple */
+					result = i;
+					*skipoffnum = prevskip;
+					/* choose again if there are even more exactly-as-good ones */
+					keep_current_best = -1;
+				}
+			}
+
+			/*
+			* If we find a tuple with zero penalty for all columns, and we've
+			* decided we don't want to search for another tuple with equal
+			* penalty, there's no need to examine remaining tuples; just break
+			* out of the loop and return it.
+			*/
+			if (zero_penalty)
+			{
+				if (keep_current_best == -1)
+				{
+					/* we didn't make the random choice yet for this old best */
+					keep_current_best = (random() <= (MAX_RANDOM_VALUE / 2)) ? 1 : 0;
+				}
+				if (keep_current_best == 1)
+					break;
+			}
 		}
 	}
 
@@ -570,7 +655,7 @@ gistdentryinit(GISTSTATE *giststate, int nkey, GISTENTRY *e,
 
 IndexTuple
 gistFormTuple(GISTSTATE *giststate, Relation r,
-			  Datum attdata[], bool isnull[], bool isleaf)
+			  Datum attdata[], bool isnull[], bool isleaf, bool isTruncated)
 {
 	Datum		compatt[INDEX_MAX_KEYS];
 	int			i;
@@ -579,7 +664,7 @@ gistFormTuple(GISTSTATE *giststate, Relation r,
 	/*
 	 * Call the compress method on each attribute.
 	 */
-	for (i = 0; i < r->rd_att->natts; i++)
+	for (i = 0; i < IndexRelationGetNumberOfKeyAttributes(r); i++)
 	{
 		if (isnull[i])
 			compatt[i] = (Datum) 0;
@@ -602,7 +687,23 @@ gistFormTuple(GISTSTATE *giststate, Relation r,
 		}
 	}
 
-	res = index_form_tuple(giststate->tupdesc, compatt, isnull);
+	if (!isTruncated)
+	{
+		/*
+		 * Allocate each included attribute.
+		 */
+		for (; i < r->rd_att->natts; i++)
+		{
+			if (isnull[i])
+				compatt[i] = (Datum) 0;
+			else
+			{
+				compatt[i] = attdata[i];
+			}
+		}
+	}
+
+	res = index_form_tuple(isTruncated?giststate->truncTupdesc:giststate->tupdesc, compatt, isnull);
 
 	/*
 	 * The offset number on tuples on internal pages is unused. For historical
@@ -643,8 +744,9 @@ gistFetchTuple(GISTSTATE *giststate, Relation r, IndexTuple tuple)
 	Datum		fetchatt[INDEX_MAX_KEYS];
 	bool		isnull[INDEX_MAX_KEYS];
 	int			i;
+	Assert(!GistTupleIsSkip(tuple));
 
-	for (i = 0; i < r->rd_att->natts; i++)
+	for (i = 0; i < IndexRelationGetNumberOfKeyAttributes(r); i++)
 	{
 		Datum		datum;
 
@@ -678,6 +780,14 @@ gistFetchTuple(GISTSTATE *giststate, Relation r, IndexTuple tuple)
 			isnull[i] = true;
 			fetchatt[i] = (Datum) 0;
 		}
+	}
+
+	/*
+	 * Get each included attribute.
+	 */
+	for (; i < r->rd_att->natts; i++)
+	{
+		fetchatt[i] = index_getattr(tuple, i + 1, giststate->tupdesc, &isnull[i]);
 	}
 	MemoryContextSwitchTo(oldcxt);
 

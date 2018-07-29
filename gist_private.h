@@ -40,6 +40,8 @@
  */
 #define GIST_MAX_SPLIT_PAGES		75
 
+#define GIST_SKIPGROUP_THRESHOLD	16
+
 /* Buffer lock modes */
 #define GIST_SHARE	BUFFER_LOCK_SHARE
 #define GIST_EXCLUSIVE	BUFFER_LOCK_EXCLUSIVE
@@ -85,6 +87,8 @@ typedef struct GISTSTATE
 	MemoryContext tempCxt;		/* short-term context for calling functions */
 
 	TupleDesc	tupdesc;		/* index's tuple descriptor */
+	TupleDesc	truncTupdesc;	/* truncated tuple descriptor
+								 * for internal pages */
 	TupleDesc	fetchTupdesc;	/* tuple descriptor for tuples returned in an
 								 * index-only scan */
 
@@ -215,6 +219,8 @@ typedef struct GISTInsertStack
 	/* offset of the downlink in the parent page, that points to this page */
 	OffsetNumber downlinkoffnum;
 
+	OffsetNumber skipoffnum;
+
 	/* pointer to parent */
 	struct GISTInsertStack *parent;
 } GISTInsertStack;
@@ -275,6 +281,12 @@ typedef struct
 #define  GistTupleSetValid(itup)	ItemPointerSetOffsetNumber( &((itup)->t_tid), TUPLE_IS_VALID )
 
 
+#define INDEX_SKIP_MASK 0x2000
+
+#define GistTupleIsSkip(itup)			((((IndexTuple) (itup))->t_info & INDEX_SKIP_MASK))
+#define GistTupleMakeSkip(itup)		((((IndexTuple) (itup))->t_info |= INDEX_SKIP_MASK))
+#define GistTupleSetSkipCount(itup, skipTupleCnt)	((((IndexTuple) (itup))->t_tid.ip_posid = skipTupleCnt))
+#define GistTupleGetSkipCount(itup)	((((IndexTuple) (itup))->t_tid.ip_posid))
 
 
 /*
@@ -403,11 +415,15 @@ extern bool gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate,
 				OffsetNumber oldoffnum, BlockNumber *newblkno,
 				Buffer leftchildbuf,
 				List **splitinfo,
-				bool markleftchild);
+				bool markleftchild,
+				int ndeltup,
+				OffsetNumber skipoffnum);
 
 extern SplitedPageLayout *gistSplit(Relation r, Page page, IndexTuple *itup,
 		  int len, GISTSTATE *giststate);
 
+extern SplitedPageLayout *gistSplitBySkipgroup(Relation r, Page page, IndexTuple *itup,
+		  int len, GISTSTATE *giststate);
 /* gistxlog.c */
 extern void gist_redo(XLogReaderState *record);
 extern void gist_desc(StringInfo buf, XLogReaderState *record);
@@ -422,7 +438,7 @@ extern XLogRecPtr gistXLogSetDeleted(RelFileNode node, Buffer buffer,
 extern XLogRecPtr gistXLogUpdate(Buffer buffer,
 			   OffsetNumber *todelete, int ntodelete,
 			   IndexTuple *itup, int ntup,
-			   Buffer leftchild);
+			   Buffer leftchild, OffsetNumber skipoffnum);
 
 extern XLogRecPtr gistXLogSplit(bool page_is_leaf,
 			  SplitedPageLayout *dist,
@@ -450,15 +466,18 @@ extern bool gistproperty(Oid index_oid, int attno,
 			 IndexAMProperty prop, const char *propname,
 			 bool *res, bool *isnull);
 extern bool gistfitpage(IndexTuple *itvec, int len);
-extern bool gistnospace(Page page, IndexTuple *itvec, int len, OffsetNumber todelete, Size freespace);
+extern bool gistnospace(Page page, IndexTuple *itvec, int len, OffsetNumber todelete, Size freespace, int ndeltup);
 extern void gistcheckpage(Relation rel, Buffer buf);
 extern Buffer gistNewBuffer(Relation r);
 extern void gistfillbuffer(Page page, IndexTuple *itup, int len,
 			   OffsetNumber off);
-extern IndexTuple *gistextractpage(Page page, int *len /* out */ );
+extern IndexTuple *gistextractpage(Page page, int *len /* out */);
+extern IndexTuple *gistextractrange(Page page, OffsetNumber start, int len);
 extern IndexTuple *gistjoinvector(
 			   IndexTuple *itvec, int *len,
-			   IndexTuple *additvec, int addlen);
+			   IndexTuple *additvec, int addlen, OffsetNumber oldoffnum);
+extern void gistfiltervector(IndexTuple *itvec, int *len);
+extern inline void gistcheckskippage(Page page);
 extern IndexTupleData *gistfillitupvec(IndexTuple *vec, int veclen, int *memlen);
 
 extern IndexTuple gistunion(Relation r, IndexTuple *itvec,
@@ -468,11 +487,13 @@ extern IndexTuple gistgetadjusted(Relation r,
 				IndexTuple addtup,
 				GISTSTATE *giststate);
 extern IndexTuple gistFormTuple(GISTSTATE *giststate,
-			  Relation r, Datum *attdata, bool *isnull, bool isleaf);
+			  Relation r, Datum *attdata, bool *isnull, bool isleaf,
+			  bool isTruncated);
 
 extern OffsetNumber gistchoose(Relation r, Page p,
 		   IndexTuple it,
-		   GISTSTATE *giststate);
+		   GISTSTATE *giststate,
+		   OffsetNumber *skipoffnum);
 
 extern void GISTInitBuffer(Buffer b, uint32 f);
 extern void gistdentryinit(GISTSTATE *giststate, int nkey, GISTENTRY *e,
