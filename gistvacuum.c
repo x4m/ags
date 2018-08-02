@@ -31,51 +31,11 @@ typedef struct
 	void	   *callback_state;
 	GistNSN		startNSN;
 	BlockNumber totFreePages;	/* true total # of free pages */
+	BlockNumber emptyPages;
 
-	char	   *internalPagesMap;
-	char	   *emptyLeafPagesMap;
-	BlockNumber mapNumPages;
+	List	   *internalPages;
+	Bitmapset  *emptyLeafPagesMap;
 } GistVacState;
-
-static void setinternal(GistVacState *state, BlockNumber blkno)
-{
-	if (state->mapNumPages <= blkno)
-		return;
-	state->internalPagesMap[blkno / 8] |= 1 << (blkno % 8);
-}
-
-static void setempty(GistVacState *state, BlockNumber blkno)
-{
-	if (state->mapNumPages <= blkno)
-		return;
-	state->emptyLeafPagesMap[blkno / 8] |= 1 << (blkno % 8);
-}
-
-static bool isinternal(GistVacState *state, BlockNumber blkno)
-{
-	if (state->mapNumPages <= blkno)
-		return false;
-	return (state->internalPagesMap[blkno / 8] & 1 << (blkno % 8)) != 0;
-}
-
-static bool isemptyleaf(GistVacState *state, BlockNumber blkno)
-{
-	if (state->mapNumPages <= blkno)
-		return false;
-	return (state->internalPagesMap[blkno / 8] & 1 << (blkno % 8)) != 0;
-}
-
-/*
- * This function is used to sort offsets
- * When employing physical scan rescan offsets are not ordered.
- */
-static int
-compare_offsetnumber(const void *x, const void *y)
-{
-	OffsetNumber a = *((OffsetNumber *)x);
-	OffsetNumber b = *((OffsetNumber *)y);
-	return a - b;
-}
 
 static void gistvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			   IndexBulkDeleteCallback callback, void *callback_state,
@@ -165,7 +125,9 @@ gistvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	vstate.callback_state = callback_state;
 	vstate.startNSN = startNSN;
 	vstate.totFreePages = 0;
-	vstate.mapNumPages = 0;
+	vstate.internalPages = NULL;
+	vstate.emptyLeafPagesMap = NULL;
+	vstate.emptyPages = 0;
 
 	/*
 	 * Need lock unless it's local to this backend.
@@ -201,27 +163,9 @@ gistvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	 */
 	needLock = !RELATION_IS_LOCAL(rel);
 
-	if (needLock)
-		LockRelationForExtension(rel, ExclusiveLock);
-	num_pages = RelationGetNumberOfBlocks(rel);
-	if (needLock)
-		UnlockRelationForExtension(rel, ExclusiveLock);
-
-	if (deletePages)
-	{
-		vstate.mapNumPages = num_pages;
-		vstate.internalPagesMap = palloc0(num_pages / 8 + 1);
-		vstate.emptyLeafPagesMap = palloc0(num_pages / 8 + 1);
-	}
-
 	blkno = GIST_ROOT_BLKNO;
 	for (;;)
 	{
-		/* Iterate over pages, then loop back to recheck length */
-		for (; blkno < num_pages; blkno++)
-		{
-			gistvacuumpage(&vstate, blkno, blkno);
-		}
 		/* Get the current relation length */
 		if (needLock)
 			LockRelationForExtension(rel, ExclusiveLock);
@@ -232,6 +176,12 @@ gistvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 		/* Quit if we've scanned the whole relation */
 		if (blkno >= num_pages)
 			break;
+
+		/* Iterate over pages, then loop back to recheck length */
+		for (; blkno < num_pages; blkno++)
+		{
+			gistvacuumpage(&vstate, blkno, blkno);
+		}
 	}
 
 	/*
@@ -255,7 +205,9 @@ gistvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 
 	if (deletePages)
 	{
-		for (blkno = GIST_ROOT_BLKNO; blkno < vstate.mapNumPages; blkno++)
+		ListCell   *cell;
+		/* rescan inner pages that had empty child pages */
+		foreach(cell, vstate.internalPages)
 		{
 			Buffer		 buffer;
 			Page		 page;
@@ -267,8 +219,10 @@ gistvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			Buffer		 buftodelete[MaxOffsetNumber];
 			int			 ntodelete = 0;
 
-			if (!isinternal(&vstate, blkno))
-				continue; /* second scan is for internal pages */
+			if (vstate.emptyPages == 0)
+				break;
+
+			blkno = (BlockNumber)lfirst_int(cell);
 
 
 			buffer = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL,
@@ -276,10 +230,7 @@ gistvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 
 			LockBuffer(buffer, GIST_EXCLUSIVE);
 			page = (Page) BufferGetPage(buffer);
-			/* Currently block of internal page cannot become leaf */
-			Assert(!GistPageIsLeaf(page));
-
-			if (PageIsNew(page) || GistPageIsDeleted(page))
+			if (PageIsNew(page) || GistPageIsDeleted(page) || GistPageIsLeaf(page))
 			{
 				UnlockReleaseBuffer(buffer);
 				continue;
@@ -291,21 +242,27 @@ gistvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			{
 				Buffer		leafBuffer;
 				Page		leafPage;
+				BlockNumber leafBlockNo;
+
+				iid = PageGetItemId(page, i);
+				idxtuple = (IndexTuple) PageGetItem(page, iid);
 				/* if this page was not empty in previous scan - we do not consider it */
-				if(!isemptyleaf(&vstate, i))
+				leafBlockNo = ItemPointerGetBlockNumber(&(idxtuple->t_tid));
+				if(!bms_is_member(leafBlockNo, vstate.emptyLeafPagesMap))
 				{
 					continue;
 				}
 
-				iid = PageGetItemId(page, i);
-				idxtuple = (IndexTuple) PageGetItem(page, iid);
-
-				leafBuffer = ReadBufferExtended(rel, MAIN_FORKNUM, ItemPointerGetBlockNumber(&(idxtuple->t_tid)),
+				leafBuffer = ReadBufferExtended(rel, MAIN_FORKNUM, leafBlockNo,
 									RBM_NORMAL, info->strategy);
 				LockBuffer(leafBuffer, GIST_EXCLUSIVE);
 				gistcheckpage(rel, leafBuffer);
 				leafPage = (Page) BufferGetPage(leafBuffer);
-				Assert(GistPageIsLeaf(leafPage));
+				if (!GistPageIsLeaf(leafPage))
+				{
+					UnlockReleaseBuffer(leafBuffer);
+					continue;
+				}
 
 				if (PageGetMaxOffsetNumber(leafPage) == InvalidOffsetNumber /* Nothing left to split */
 					&& !(GistFollowRight(leafPage) || GistPageGetNSN(page) < GistPageGetNSN(leafPage)) /* No follow-right */
@@ -321,17 +278,13 @@ gistvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 
 			if (ntodelete)
 			{
-				TransactionId txid;
-				/* Prepare possibly onurdered offsets */
-				qsort(todelete, ntodelete, sizeof(OffsetNumber), compare_offsetnumber);
-
 				/*
 				 * Like in _bt_unlink_halfdead_page we need a upper bound on xid
 				 * that could hold downlinks to this page. We use
 				 * ReadNewTransactionId() to instead of GetCurrentTransactionId
 				 * since we are in a VACUUM.
 				 */
-				txid = ReadNewTransactionId();
+				TransactionId txid = ReadNewTransactionId();
 
 				START_CRIT_SECTION();
 
@@ -345,6 +298,7 @@ gistvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 					GistPageSetDeleted(leafPage);
 					MarkBufferDirty(buftodelete[i]);
 					stats->pages_deleted++;
+					vstate.emptyPages--;
 
 					MarkBufferDirty(buffer);
 					/* Offsets are changed as long as we delete tuples from internal page */
@@ -372,8 +326,8 @@ gistvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			UnlockReleaseBuffer(buffer);
 		}
 
-		pfree(vstate.emptyLeafPagesMap);
-		pfree(vstate.internalPagesMap);
+		bms_free(vstate.emptyLeafPagesMap);
+		list_free(vstate.internalPages);
 	}
 }
 
@@ -473,7 +427,7 @@ restart:
 
 				recptr = gistXLogUpdate(buffer,
 										todelete, ntodelete,
-										NULL, 0, InvalidBuffer, InvalidOffsetNumber);
+										NULL, 0, InvalidBuffer);
 				PageSetLSN(page, recptr);
 			}
 			else
@@ -489,11 +443,14 @@ restart:
 		stats->num_index_tuples += maxoff - FirstOffsetNumber + 1;
 
 		if (maxoff - FirstOffsetNumber + 1 == 0)
-			setempty(vstate, blkno);
+		{
+			vstate->emptyLeafPagesMap = bms_add_member(vstate->emptyLeafPagesMap, blkno);
+			vstate->emptyPages++;
+		}
 	}
 	else
 	{
-		setinternal(vstate, blkno);
+		vstate->internalPages = lappend_int(vstate->internalPages, blkno);
 	}
 
 	UnlockReleaseBuffer(buffer);
