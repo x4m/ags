@@ -427,7 +427,7 @@ restart:
 
 				recptr = gistXLogUpdate(buffer,
 										todelete, ntodelete,
-										NULL, 0, InvalidBuffer);
+										NULL, 0, InvalidBuffer, InvalidOffsetNumber);
 				PageSetLSN(page, recptr);
 			}
 			else
