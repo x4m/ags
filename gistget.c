@@ -4,7 +4,7 @@
  *	  fetch tuples from a GiST scan.
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -14,15 +14,15 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
 #include "gist_private.h"
 #include "access/relscan.h"
-#include "catalog/pg_type.h"
 #include "miscadmin.h"
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
 #include "pgstat.h"
 #include "lib/pairingheap.h"
-#include "utils/builtins.h"
+#include "utils/float.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
@@ -164,7 +164,7 @@ gistindex_keytest(IndexScanDesc scan,
 
 		datum = index_getattr(tuple,
 							  key->sk_attno,
-							  giststate->tupdesc,
+							  giststate->leafTupdesc,
 							  &isNull);
 
 		if (key->sk_flags & SK_ISNULL)
@@ -244,7 +244,7 @@ gistindex_keytest(IndexScanDesc scan,
 
 		datum = index_getattr(tuple,
 							  key->sk_attno,
-							  giststate->tupdesc,
+							  giststate->leafTupdesc,
 							  &isNull);
 
 		if ((key->sk_flags & SK_ISNULL) || isNull)
@@ -552,7 +552,6 @@ getNextNearest(IndexScanDesc scan)
 {
 	GISTScanOpaque so = (GISTScanOpaque) scan->opaque;
 	bool		res = false;
-	int			i;
 
 	if (scan->xs_hitup)
 	{
@@ -571,47 +570,12 @@ getNextNearest(IndexScanDesc scan)
 		if (GISTSearchItemIsHeap(*item))
 		{
 			/* found a heap item at currently minimal distance */
-			scan->xs_ctup.t_self = item->data.heap.heapPtr;
+			scan->xs_heaptid = item->data.heap.heapPtr;
 			scan->xs_recheck = item->data.heap.recheck;
-			scan->xs_recheckorderby = item->data.heap.recheckDistances;
-			for (i = 0; i < scan->numberOfOrderBys; i++)
-			{
-				if (so->orderByTypes[i] == FLOAT8OID)
-				{
-#ifndef USE_FLOAT8_BYVAL
-					/* must free any old value to avoid memory leakage */
-					if (!scan->xs_orderbynulls[i])
-						pfree(DatumGetPointer(scan->xs_orderbyvals[i]));
-#endif
-					scan->xs_orderbyvals[i] = Float8GetDatum(item->distances[i]);
-					scan->xs_orderbynulls[i] = false;
-				}
-				else if (so->orderByTypes[i] == FLOAT4OID)
-				{
-					/* convert distance function's result to ORDER BY type */
-#ifndef USE_FLOAT4_BYVAL
-					/* must free any old value to avoid memory leakage */
-					if (!scan->xs_orderbynulls[i])
-						pfree(DatumGetPointer(scan->xs_orderbyvals[i]));
-#endif
-					scan->xs_orderbyvals[i] = Float4GetDatum((float4) item->distances[i]);
-					scan->xs_orderbynulls[i] = false;
-				}
-				else
-				{
-					/*
-					 * If the ordering operator's return value is anything
-					 * else, we don't know how to convert the float8 bound
-					 * calculated by the distance function to that.  The
-					 * executor won't actually need the order by values we
-					 * return here, if there are no lossy results, so only
-					 * insist on converting if the *recheck flag is set.
-					 */
-					if (scan->xs_recheckorderby)
-						elog(ERROR, "GiST operator family's FOR ORDER BY operator must return float8 or float4 if the distance function is lossy");
-					scan->xs_orderbynulls[i] = true;
-				}
-			}
+
+			index_store_float8_orderby_distances(scan, so->orderByTypes,
+												 item->distances,
+												 item->data.heap.recheckDistances);
 
 			/* in an index-only scan, also return the reconstructed tuple. */
 			if (scan->xs_want_itup)
@@ -695,7 +659,7 @@ gistgettuple(IndexScanDesc scan, ScanDirection dir)
 							so->pageData[so->curPageData - 1].offnum;
 				}
 				/* continuing to return tuples from a leaf page */
-				scan->xs_ctup.t_self = so->pageData[so->curPageData].heapPtr;
+				scan->xs_heaptid = so->pageData[so->curPageData].heapPtr;
 				scan->xs_recheck = so->pageData[so->curPageData].recheck;
 
 				/* in an index-only scan, also return the reconstructed tuple */
@@ -814,14 +778,14 @@ gistgetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
  *
  * Opclasses that implement a fetch function support index-only scans.
  * Opclasses without compression functions also support index-only scans.
- * Included attributes can be returned.
+ * Included attributes always can be fetched for index-only scans.
  */
 bool
 gistcanreturn(Relation index, int attno)
 {
-	if (OidIsValid(index_getprocid(index, attno, GIST_FETCH_PROC)) ||
-		!OidIsValid(index_getprocid(index, attno, GIST_COMPRESS_PROC))||
-		attno > IndexRelationGetNumberOfKeyAttributes(index))
+	if (attno > IndexRelationGetNumberOfKeyAttributes(index) ||
+		OidIsValid(index_getprocid(index, attno, GIST_FETCH_PROC)) ||
+		!OidIsValid(index_getprocid(index, attno, GIST_COMPRESS_PROC)))
 		return true;
 	else
 		return false;

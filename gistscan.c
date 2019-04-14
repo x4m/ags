@@ -4,7 +4,7 @@
  *	  routines to manage scans on GiST index relations
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -169,7 +169,7 @@ gistrescan(IndexScanDesc scan, ScanKey key, int nkeys,
 		 */
 		natts = RelationGetNumberOfAttributes(scan->indexRelation);
 		nkeyatts = IndexRelationGetNumberOfKeyAttributes(scan->indexRelation);
-		so->giststate->fetchTupdesc = CreateTemplateTupleDesc(natts, false);
+		so->giststate->fetchTupdesc = CreateTemplateTupleDesc(natts);
 		for (attno = 1; attno <= nkeyatts; attno++)
 		{
 			TupleDescInitEntry(so->giststate->fetchTupdesc, attno, NULL,
@@ -181,7 +181,8 @@ gistrescan(IndexScanDesc scan, ScanKey key, int nkeys,
 		{
 			/* taking opcintype from giststate->tupdesc */
 			TupleDescInitEntry(so->giststate->fetchTupdesc, attno, NULL,
-					TupleDescAttr(so->giststate->tupdesc, attno - 1)->atttypid,
+							   TupleDescAttr(so->giststate->leafTupdesc,
+											 attno - 1)->atttypid,
 							   -1, 0);
 		}
 		scan->xs_hitupdesc = so->giststate->fetchTupdesc;

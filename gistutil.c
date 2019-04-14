@@ -4,7 +4,7 @@
  *	  utilities routines for the postgres GiST index access method.
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -21,9 +21,10 @@
 #include "catalog/pg_opclass.h"
 #include "storage/indexfsm.h"
 #include "storage/lmgr.h"
-#include "utils/builtins.h"
+#include "utils/float.h"
 #include "utils/syscache.h"
 #include "utils/snapmgr.h"
+#include "utils/lsyscache.h"
 
 
 /*
@@ -216,7 +217,7 @@ gistMakeUnionItVec(GISTSTATE *giststate, IndexTuple *itvec, int len,
 
 	evec = (GistEntryVector *) palloc((len + 2) * sizeof(GISTENTRY) + GEVHDRSZ);
 
-	for (i = 0; i < giststate->truncTupdesc->natts; i++)
+	for (i = 0; i < giststate->nonLeafTupdesc->natts; i++)
 	{
 		int			j;
 
@@ -227,7 +228,8 @@ gistMakeUnionItVec(GISTSTATE *giststate, IndexTuple *itvec, int len,
 			Datum		datum;
 			bool		IsNull;
 
-			datum = index_getattr(itvec[j], i + 1, giststate->tupdesc, &IsNull);
+			datum = index_getattr(itvec[j], i + 1, giststate->leafTupdesc,
+								  &IsNull);
 			if (IsNull)
 				continue;
 
@@ -277,7 +279,7 @@ gistunion(Relation r, IndexTuple *itvec, int len, GISTSTATE *giststate)
 
 	gistMakeUnionItVec(giststate, itvec, len, attr, isnull);
 
-	return gistFormTuple(giststate, r, attr, isnull, false, true);
+	return gistFormTuple(giststate, r, attr, isnull, false);
 }
 
 /*
@@ -356,7 +358,7 @@ gistDeCompressAtt(GISTSTATE *giststate, Relation r, IndexTuple tuple, Page p,
 	{
 		Datum		datum;
 
-		datum = index_getattr(tuple, i + 1, giststate->tupdesc, &isnull[i]);
+		datum = index_getattr(tuple, i + 1, giststate->leafTupdesc, &isnull[i]);
 		gistdentryinit(giststate, i, &attdata[i],
 					   datum, r, p, o,
 					   false, isnull[i]);
@@ -411,7 +413,7 @@ gistgetadjusted(Relation r, IndexTuple oldtup, IndexTuple addtup, GISTSTATE *gis
 	if (neednew)
 	{
 		/* need to update key */
-		newtup = gistFormTuple(giststate, r, attr, isnull, false, true);
+		newtup = gistFormTuple(giststate, r, attr, isnull, false);
 		newtup->t_tid = oldtup->t_tid;
 		if (GistTupleIsSkip(oldtup))
 		{
@@ -509,7 +511,7 @@ gistchoose(Relation r, Page p, IndexTuple it,	/* it has compressed entry */
 
 			prevskip = i;
 
-			datum = index_getattr(itup, 1, giststate->tupdesc, &IsNull);
+			datum = index_getattr(itup, 1, giststate->nonLeafTupdesc, &IsNull);
 			gistdentryinit(giststate, 0, &entry, datum, r, p, i,
 							false, IsNull);
 			usize = gistpenalty(giststate, 0, &entry, IsNull,
@@ -531,7 +533,7 @@ gistchoose(Relation r, Page p, IndexTuple it,	/* it has compressed entry */
 				bool		IsNull;
 
 				/* Compute penalty for this column. */
-				datum = index_getattr(itup, j + 1, giststate->tupdesc, &IsNull);
+				datum = index_getattr(itup, j + 1, giststate->nonLeafTupdesc, &IsNull);
 				gistdentryinit(giststate, j, &entry, datum, r, p, i,
 							false, IsNull);
 				usize = gistpenalty(giststate, j, &entry, IsNull,
@@ -553,7 +555,7 @@ gistchoose(Relation r, Page p, IndexTuple it,	/* it has compressed entry */
 					*skipoffnum = prevskip;
 					best_penalty[j] = usize;
 
-					if (j < IndexRelationGetNumberOfKeyAttributes(r) - 1)
+					if (j < r->rd_att->natts - 1)
 						best_penalty[j + 1] = -1;
 
 					/* we have new best, so reset keep-it decision */
@@ -583,7 +585,7 @@ gistchoose(Relation r, Page p, IndexTuple it,	/* it has compressed entry */
 			* If we looped past the last column, and did not update "result",
 			* then this tuple is exactly as good as the prior best tuple.
 			*/
-			if (j == IndexRelationGetNumberOfKeyAttributes(r) && result != i)
+			if (j == r->rd_att->natts && result != i)
 			{
 				if (keep_current_best == -1)
 				{
@@ -655,7 +657,7 @@ gistdentryinit(GISTSTATE *giststate, int nkey, GISTENTRY *e,
 
 IndexTuple
 gistFormTuple(GISTSTATE *giststate, Relation r,
-			  Datum attdata[], bool isnull[], bool isleaf, bool isTruncated)
+			  Datum attdata[], bool isnull[], bool isleaf)
 {
 	Datum		compatt[INDEX_MAX_KEYS];
 	int			i;
@@ -687,23 +689,23 @@ gistFormTuple(GISTSTATE *giststate, Relation r,
 		}
 	}
 
-	if (!isTruncated)
+	if (isleaf)
 	{
 		/*
-		 * Allocate each included attribute.
+		 * Emplace each included attribute if any.
 		 */
 		for (; i < r->rd_att->natts; i++)
 		{
 			if (isnull[i])
 				compatt[i] = (Datum) 0;
 			else
-			{
 				compatt[i] = attdata[i];
-			}
 		}
 	}
 
-	res = index_form_tuple(isTruncated?giststate->truncTupdesc:giststate->tupdesc, compatt, isnull);
+	res = index_form_tuple(isleaf ? giststate->leafTupdesc :
+						   giststate->nonLeafTupdesc,
+						   compatt, isnull);
 
 	/*
 	 * The offset number on tuples on internal pages is unused. For historical
@@ -750,7 +752,7 @@ gistFetchTuple(GISTSTATE *giststate, Relation r, IndexTuple tuple)
 	{
 		Datum		datum;
 
-		datum = index_getattr(tuple, i + 1, giststate->tupdesc, &isnull[i]);
+		datum = index_getattr(tuple, i + 1, giststate->leafTupdesc, &isnull[i]);
 
 		if (giststate->fetchFn[i].fn_oid != InvalidOid)
 		{
@@ -787,7 +789,8 @@ gistFetchTuple(GISTSTATE *giststate, Relation r, IndexTuple tuple)
 	 */
 	for (; i < r->rd_att->natts; i++)
 	{
-		fetchatt[i] = index_getattr(tuple, i + 1, giststate->tupdesc, &isnull[i]);
+		fetchatt[i] = index_getattr(tuple, i + 1, giststate->leafTupdesc,
+									&isnull[i]);
 	}
 	MemoryContextSwitchTo(oldcxt);
 
@@ -912,13 +915,31 @@ gistNewBuffer(Relation r)
 		{
 			Page		page = BufferGetPage(buffer);
 
+			/*
+			 * If the page was never initialized, it's OK to use.
+			 */
 			if (PageIsNew(page))
-				return buffer;	/* OK to use, if never initialized */
+				return buffer;
 
 			gistcheckpage(r, buffer);
 
-			if (GistPageIsDeleted(page) && TransactionIdPrecedes(GistPageGetDeleteXid(page), RecentGlobalDataXmin))
-				return buffer;	/* OK to use */
+			/*
+			 * Otherwise, recycle it if deleted, and too old to have any processes
+			 * interested in it.
+			 */
+			if (gistPageRecyclable(page))
+			{
+				/*
+				 * If we are generating WAL for Hot Standby then create a
+				 * WAL record that will allow us to conflict with queries
+				 * running on standby, in case they have snapshots older
+				 * than the page's deleteXid.
+				 */
+				if (XLogStandbyInfoActive() && RelationNeedsWAL(r))
+					gistXLogPageReuse(r, blkno, GistPageGetDeleteXid(page));
+
+				return buffer;
+			}
 
 			LockBuffer(buffer, GIST_UNLOCK);
 		}
@@ -940,6 +961,15 @@ gistNewBuffer(Relation r)
 		UnlockRelationForExtension(r, ExclusiveLock);
 
 	return buffer;
+}
+
+/* Can this page be recycled yet? */
+bool
+gistPageRecyclable(Page page)
+{
+	return PageIsNew(page) ||
+		(GistPageIsDeleted(page) &&
+		 TransactionIdPrecedes(GistPageGetDeleteXid(page), RecentGlobalXmin));
 }
 
 bytea *
@@ -982,12 +1012,6 @@ gistproperty(Oid index_oid, int attno,
 			 IndexAMProperty prop, const char *propname,
 			 bool *res, bool *isnull)
 {
-	HeapTuple	tuple;
-	Form_pg_index rd_index PG_USED_FOR_ASSERTS_ONLY;
-	Form_pg_opclass rd_opclass;
-	Datum		datum;
-	bool		disnull;
-	oidvector  *indclass;
 	Oid			opclass,
 				opfamily,
 				opcintype;
@@ -1021,41 +1045,19 @@ gistproperty(Oid index_oid, int attno,
 	}
 
 	/* First we need to know the column's opclass. */
-
-	tuple = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(index_oid));
-	if (!HeapTupleIsValid(tuple))
+	opclass = get_index_column_opclass(index_oid, attno);
+	if (!OidIsValid(opclass))
 	{
 		*isnull = true;
 		return true;
 	}
-	rd_index = (Form_pg_index) GETSTRUCT(tuple);
-
-	/* caller is supposed to guarantee this */
-	Assert(attno > 0 && attno <= rd_index->indnatts);
-
-	datum = SysCacheGetAttr(INDEXRELID, tuple,
-							Anum_pg_index_indclass, &disnull);
-	Assert(!disnull);
-
-	indclass = ((oidvector *) DatumGetPointer(datum));
-	opclass = indclass->values[attno - 1];
-
-	ReleaseSysCache(tuple);
 
 	/* Now look up the opclass family and input datatype. */
-
-	tuple = SearchSysCache1(CLAOID, ObjectIdGetDatum(opclass));
-	if (!HeapTupleIsValid(tuple))
+	if (!get_opclass_opfamily_and_input_type(opclass, &opfamily, &opcintype))
 	{
 		*isnull = true;
 		return true;
 	}
-	rd_opclass = (Form_pg_opclass) GETSTRUCT(tuple);
-
-	opfamily = rd_opclass->opcfamily;
-	opcintype = rd_opclass->opcintype;
-
-	ReleaseSysCache(tuple);
 
 	/* And now we can check whether the function is provided. */
 
@@ -1078,6 +1080,8 @@ gistproperty(Oid index_oid, int attno,
 									  Int16GetDatum(GIST_COMPRESS_PROC));
 	}
 
+	*isnull = false;
+
 	return true;
 }
 
@@ -1089,7 +1093,7 @@ gistproperty(Oid index_oid, int attno,
 XLogRecPtr
 gistGetFakeLSN(Relation rel)
 {
-	static XLogRecPtr counter = 1;
+	static XLogRecPtr counter = FirstNormalUnloggedLSN;
 
 	if (rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
 	{
