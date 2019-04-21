@@ -16,6 +16,7 @@
 
 #include "gist_private.h"
 #include "gistscan.h"
+#include "access/generic_xlog.h"
 #include "catalog/pg_collation.h"
 #include "miscadmin.h"
 #include "storage/lmgr.h"
@@ -30,14 +31,14 @@
 /* non-export function prototypes */
 static void gistfixsplit(GISTInsertState *state, GISTSTATE *giststate);
 static bool gistinserttuple(GISTInsertState *state, GISTInsertStack *stack,
-				GISTSTATE *giststate, IndexTuple tuple, OffsetNumber oldoffnum);
+							GISTSTATE *giststate, IndexTuple tuple, OffsetNumber oldoffnum);
 static bool gistinserttuples(GISTInsertState *state, GISTInsertStack *stack,
-				 GISTSTATE *giststate,
-				 IndexTuple *tuples, int ntup, OffsetNumber oldoffnum,
-				 Buffer leftchild, Buffer rightchild,
-				 bool unlockbuf, bool unlockleftchild, int ndeltup, OffsetNumber skipoffnum);
+							 GISTSTATE *giststate,
+							 IndexTuple *tuples, int ntup, OffsetNumber oldoffnum,
+							 Buffer leftchild, Buffer rightchild,
+							 bool unlockbuf, bool unlockleftchild, int ndeltup, OffsetNumber skipoffnum);
 static void gistfinishsplit(GISTInsertState *state, GISTInsertStack *stack,
-				GISTSTATE *giststate, List *splitinfo, bool releasebuf);
+							GISTSTATE *giststate, List *splitinfo, bool releasebuf);
 static void gistprunepage(Relation rel, Page page, Buffer buffer,
 			  Relation heapRel);
 
@@ -59,7 +60,7 @@ PG_FUNCTION_INFO_V1(agshandler);
  * and callbacks.
  */
 Datum
-agshandler(PG_FUNCTION_ARGS)
+	agshandler(PG_FUNCTION_ARGS)
 {
 	IndexAmRoutine *amroutine = makeNode(IndexAmRoutine);
 
@@ -220,17 +221,18 @@ gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate,
 				Buffer buffer,
 				IndexTuple *itup, int ntup, OffsetNumber oldoffnum,
 				BlockNumber *newblkno,
-				Buffer leftchildbuf,
-				List **splitinfo,
-				bool markfollowright,
-				Relation heapRel,
-				bool is_build,
-				int ndeltup,
+					 Buffer leftchildbuf,
+					 List **splitinfo,
+					 bool markfollowright,
+					 Relation heapRel,
+					 bool is_build,
+					 int ndeltup,
 				OffsetNumber skipoffnum)
 {
 	BlockNumber blkno = BufferGetBlockNumber(buffer);
 	Page		page = BufferGetPage(buffer);
 	bool		is_leaf = (GistPageIsLeaf(page)) ? true : false;
+	GenericXLogState	*state;
 	XLogRecPtr	recptr;
 	int			i;
 	bool		is_split;
@@ -525,9 +527,16 @@ gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate,
 		else
 		{
 			if (RelationNeedsWAL(rel))
-				recptr = gistXLogSplit(is_leaf,
-									   dist, oldrlink, oldnsn, leftchildbuf,
-									   markfollowright);
+			{
+				state = GenericXLogStart(rel);
+				for (ptr = dist; ptr; ptr = ptr->next)
+				{
+					GenericXLogRegisterBuffer(state, ptr->buffer, GENERIC_XLOG_FULL_IMAGE);
+				}
+				
+				recptr = GenericXLogFinish(state);
+			}
+				
 			else
 				recptr = gistGetFakeLSN(rel);
 		}
@@ -604,19 +613,10 @@ gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate,
 		{
 			if (RelationNeedsWAL(rel))
 			{
-				OffsetNumber ndeloffs = 0,
-							deloffs[BLCKSZ /sizeof(ItemIdData)];
-
-				if (OffsetNumberIsValid(oldoffnum))
-				{
-					for (i = 0; i < ndeltup; i++)
-						deloffs[i] = oldoffnum + i;
-					ndeloffs = ndeltup;
-				}
-
-				recptr = gistXLogUpdate(buffer,
-										deloffs, ndeloffs, itup, ntup,
-										leftchildbuf, skipoffnum);
+				state = GenericXLogStart(rel);
+				GenericXLogRegisterBuffer(state, buffer, GENERIC_XLOG_FULL_IMAGE);
+				GenericXLogRegisterBuffer(state, leftchildbuf, GENERIC_XLOG_FULL_IMAGE);
+				recptr = GenericXLogFinish(state);
 			}
 			else
 				recptr = gistGetFakeLSN(rel);
@@ -1414,7 +1414,7 @@ inline void
 gistcheckskippage(Page page)
 {
 	OffsetNumber i,
-				maxoff;
+		maxoff;
 	int skiplast = 0;
 	bool wasskip = false;
 	Assert(false);
@@ -1485,7 +1485,7 @@ gisttestskipgroup(GISTInsertState *state, GISTInsertStack *stack,
 			}
 		}
 		gistinserttuples(state, stack, giststate, itvec, totalsize, skipoffnum,
-							InvalidBuffer, InvalidBuffer, false, false, skipsize + 1, InvalidOffsetNumber);
+						 InvalidBuffer, InvalidBuffer, false, false, skipsize + 1, InvalidOffsetNumber);
 	}
 }
 
@@ -1647,7 +1647,7 @@ gistSplit(Relation r,
 	if (!gistfitpage(lvectup, v.splitVector.spl_nleft))
 	{
 		SplitedPageLayout *resptr,
-				   *subres;
+			*subres;
 
 		resptr = subres = gistSplit(r, page, lvectup, v.splitVector.spl_nleft, giststate);
 
@@ -1677,7 +1677,7 @@ gistSplitBySkipgroup(Relation r,
 		  GISTSTATE *giststate)
 {
 	IndexTuple *lvectup,
-			   *rvectup,
+		*rvectup,
 			   *skiptuples;
 	OffsetNumber *skipoffsets;
 	GistSplitVector v;
@@ -1760,7 +1760,7 @@ gistSplitBySkipgroup(Relation r,
 	if (!gistfitpage(lvectup, v.splitVector.spl_nleft))
 	{
 		SplitedPageLayout *resptr,
-				   *subres;
+			*subres;
 
 		resptr = subres = gistSplitBySkipgroup(r, page, lvectup, v.splitVector.spl_nleft, giststate);
 		if (subres == NULL)
@@ -1972,10 +1972,11 @@ gistprunepage(Relation rel, Page page, Buffer buffer, Relation heapRel)
 		if (RelationNeedsWAL(rel))
 		{
 			XLogRecPtr	recptr;
+			GenericXLogState	*state;
 
-			recptr = gistXLogDelete(buffer,
-									deletable, ndeletable,
-									heapRel->rd_node);
+			state = GenericXLogStart(rel);
+			GenericXLogRegisterBuffer(state, buffer, GENERIC_XLOG_FULL_IMAGE);
+			recptr = GenericXLogFinish(state);
 
 			PageSetLSN(page, recptr);
 		}

@@ -17,6 +17,7 @@
 #include "access/genam.h"
 #include "gist_private.h"
 #include "access/transam.h"
+#include "access/generic_xlog.h"
 #include "commands/vacuum.h"
 #include "lib/integerset.h"
 #include "miscadmin.h"
@@ -367,10 +368,12 @@ restart:
 			if (RelationNeedsWAL(rel))
 			{
 				XLogRecPtr	recptr;
+				GenericXLogState	*state;
+				
+				state = GenericXLogStart(rel);
+				GenericXLogRegisterBuffer(state, buffer, GENERIC_XLOG_FULL_IMAGE);
+				recptr = GenericXLogFinish(state);
 
-				recptr = gistXLogDelete(buffer,
-										todelete, ntodelete,
-										rel->rd_node);
 				PageSetLSN(page, recptr);
 			}
 			else
@@ -663,7 +666,13 @@ gistdeletepage(IndexVacuumInfo *info, GistBulkDeleteResult *stats,
 	PageIndexTupleDelete(parentPage, downlink);
 
 	if (RelationNeedsWAL(info->index))
-		recptr = gistXLogPageDelete(leafBuffer, txid, parentBuffer, downlink);
+	{
+		GenericXLogState	*state;
+
+		state = GenericXLogStart(info->index);
+		GenericXLogRegisterBuffer(state, leafBuffer, GENERIC_XLOG_FULL_IMAGE);
+		recptr = GenericXLogFinish(state);
+	}
 	else
 		recptr = gistGetFakeLSN(info->index);
 	PageSetLSN(parentPage, recptr);

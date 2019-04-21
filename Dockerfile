@@ -28,7 +28,7 @@ RUN localedef -i en_US -c -f UTF-8 en_US.UTF-8
 RUN groupadd -r postgres --gid=999 \
     && useradd -m -r -g postgres --uid=999 postgres
 WORKDIR /home/postgres
-RUN su postgres -c "git clone https://github.com/postgres/postgres.git --depth=1 --branch=REL_11_STABLE"
+RUN su postgres -c "git clone https://github.com/postgres/postgres.git --depth=1 --branch=master"
 WORKDIR /home/postgres/postgres
 COPY . ./contrib/ags
 RUN su postgres -c "./configure  \
@@ -45,12 +45,6 @@ RUN make install
 WORKDIR /home/postgres/postgres/contrib/ags
 RUN make install
 RUN chown -R postgres:postgres /usr/local/pgsql
-RUN su postgres -c "export PATH=$PATH:/usr/local/pgsql/bin && ./test.sh"
-# ENTRYPOINT [ "./test.sh" ]
-
-# RUN make install
-# RUN make -C contrib install
-
-# RUN cd project && make
-
-# CMD ["/bin/bash", "~/project/text.sh"]
+# RUN su postgres -c "export PATH=$PATH:/usr/local/pgsql/bin && ./test.sh"
+ENV PGINSTALL /usr/local/pgsql
+RUN su postgres -c "export PATH=$PATH:/usr/local/pgsql/bin && ./create_replica.sh"
